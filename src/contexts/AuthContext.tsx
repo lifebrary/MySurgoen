@@ -1,14 +1,11 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { User, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut as firebaseSignOut, onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, setDoc, collection } from 'firebase/firestore';
-import { auth, db, Profile, isFirebaseAvailable } from '../lib/firebase';
-import { useError } from './ErrorContext';
+import { User, Session } from '@supabase/supabase-js';
+import { supabase, Profile } from '../lib/supabase';
 
 interface AuthContextType {
   user: User | null;
   profile: Profile | null;
   loading: boolean;
-  isFirebaseAvailable: boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string, fullName: string, role: 'patient' | 'surgeon') => Promise<void>;
   signOut: () => Promise<void>;
@@ -28,115 +25,90 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
-  const [firebaseAvailable, setFirebaseAvailable] = useState(false);
-  const { showFirebaseError, showServiceUnavailable } = useError();
 
   useEffect(() => {
-    const available = isFirebaseAvailable();
-    setFirebaseAvailable(available);
-    
-    if (!available || !auth) {
-      console.warn('Firebase not available, running in demo mode');
-      setLoading(false);
-      // Show service unavailable notification
-      showServiceUnavailable('Firebase Authentication', 'sign in/sign up');
-      return;
-    }
+    // Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      if (session?.user) {
+        fetchProfile(session.user.id);
+      } else {
+        setLoading(false);
+      }
+    });
 
     // Listen for auth changes
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setUser(user);
-      if (user) {
-        await fetchProfile(user.uid);
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange(async (event, session) => {
+      setUser(session?.user ?? null);
+      if (session?.user) {
+        await fetchProfile(session.user.id);
       } else {
         setProfile(null);
         setLoading(false);
       }
     });
 
-    return () => unsubscribe();
+    return () => subscription.unsubscribe();
   }, []);
 
   const fetchProfile = async (userId: string) => {
-    if (!firebaseAvailable || !db) {
-      console.warn('Firebase not available, cannot fetch profile');
-      setLoading(false);
-      return;
-    }
     try {
-      const profileDoc = await getDoc(doc(db, 'profiles', userId));
-      
-      if (profileDoc.exists()) {
-        const profileData = profileDoc.data() as Profile;
-        setProfile({ ...profileData, id: profileDoc.id });
-      } else {
-        console.log('No profile found for user:', userId);
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single();
+
+      if (error) {
+        console.error('Error fetching profile:', error);
         setProfile(null);
+      } else {
+        setProfile(data);
       }
     } catch (error) {
       console.error('Error fetching profile:', error);
-      showFirebaseError('fetch profile', error);
+      setProfile(null);
     } finally {
       setLoading(false);
     }
   };
 
   const signIn = async (email: string, password: string) => {
-    if (!firebaseAvailable || !auth) {
-      showServiceUnavailable('Firebase Authentication', 'sign in');
-      throw new Error('Firebase not available. Please check your configuration.');
-    }
-    try {
-      await signInWithEmailAndPassword(auth, email, password);
-    } catch (error) {
-      console.error('Error signing in:', error);
-      showFirebaseError('sign in', error);
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
       throw error;
     }
   };
 
   const signUp = async (email: string, password: string, fullName: string, role: 'patient' | 'surgeon') => {
-    if (!firebaseAvailable || !auth || !db) {
-      showServiceUnavailable('Firebase Authentication', 'sign up');
-      throw new Error('Firebase not available. Please check your configuration.');
-    }
-    try {
-      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-      const user = userCredential.user;
-      
-      if (user) {
-        // Create profile in Firestore
-        const [firstName, ...lastNameParts] = fullName.split(' ');
-        const lastName = lastNameParts.join(' ');
-        
-        const profileData: Omit<Profile, 'id'> = {
-          email,
-          role,
-          firstName,
-          lastName,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-        
-        await setDoc(doc(db, 'profiles', user.uid), profileData);
-      }
-    } catch (error) {
-      console.error('Error signing up:', error);
-      showFirebaseError('sign up', error);
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          full_name: fullName,
+          role: role,
+        },
+      },
+    });
+
+    if (error) {
       throw error;
     }
+
+    // The profile will be created automatically by the database trigger
+    // defined in the database-setup.sql file
   };
 
   const signOut = async () => {
-    if (!firebaseAvailable || !auth) {
-      console.warn('Firebase not available, cannot sign out');
-      return;
-    }
-    try {
-      await firebaseSignOut(auth);
-    } catch (error) {
-      console.error('Error signing out:', error);
-      showFirebaseError('sign out', error);
+    const { error } = await supabase.auth.signOut();
+    if (error) {
       throw error;
     }
   };
@@ -145,7 +117,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     user,
     profile,
     loading,
-    isFirebaseAvailable: firebaseAvailable,
     signIn,
     signUp,
     signOut,
